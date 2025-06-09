@@ -141,8 +141,8 @@ class Server:
 
     async def _check_registration(self, client: Client):
         """检查客户端是否已通过发送 NICK 和 USER 完成注册"""
-        if client.nickname and client.username and not client.realname: # realname is set here for logic simplicity
-            client.realname = "registered" # Mark as registered
+        if client.nickname and client.username and not client.realname:
+            client.realname = "registered"
             # 001: Welcome message
             await client.send(f":{config.SERVER_NAME} 001 {client.nickname} :欢迎来到 {config.SERVER_NAME} IRC 服务器")
             # 002: Your host is...
@@ -220,26 +220,20 @@ class Server:
             return
 
         channel_name = args[0]
-        key = args[1] if len(args) > 1 else None # <-- 新增：获取用户提供的密码 (key)
+        key = args[1] if len(args) > 1 else None
 
         if channel_name not in self.channels:
-            # 在旧版本中，这里是直接拒绝。现在我们允许管理员创建频道，但普通用户只能加入已存在的。
-            # 这部分逻辑保持不变，因为创建是由 /create 命令完成的。
             await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :No such channel, it must be created by an operator first.")
             return
 
         channel = self.channels[channel_name]
         if client in channel.clients:
-            return # Already in channel
+            return
 
-        # --- 核心改动：密码检查 ---
         if channel.password:
             if not key or key != channel.password:
-                # 475 ERR_BADCHANNELKEY 是 IRC 中密码错误的 标准数字回复
                 await client.send(f":{config.SERVER_NAME} 475 {client.nickname} {channel_name} :Cannot join channel (+k) - incorrect password")
-                return # 密码错误，终止加入流程
-
-        # --- 密码检查结束 ---
+                return
 
         channel.add_client(client)
         logging.info(f"客户端 {client.nickname} 加入频道 {channel_name}")
@@ -399,7 +393,7 @@ class Server:
             return
 
         channel_name = args[0]
-        password = args[1] if len(args) > 1 else None  # <-- 新增：获取可选的密码参数
+        password = args[1] if len(args) > 1 else None
 
         if not channel_name.startswith('#'):
             await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :Invalid channel name, must start with #.")
