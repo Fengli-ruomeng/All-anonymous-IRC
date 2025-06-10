@@ -1,5 +1,4 @@
 # All-anonymous-IRC
-
 Even in the 21st century, I still believe the pure art of communication found in IRC is unmatched by modern social media.
 
 Just imagine: on some obscure corner of the internet, you and a group of people from all corners of the globe, arriving for various reasons. No account, no password, no authentication whatsoever – you were simply you. And there, you could simply enjoy pure communication (though I understand, of course, that unregulated services often devolve into rampant hostility and abusive language). To me, this is a beautiful ideal, full of art and a strong sense of nostalgia.
@@ -42,7 +41,7 @@ That's it. Simple as that.
 
 - We plan to create a packaged version once the project matures.
 
-### Client-side
+### Client-side[Same as GUI-Client]
 
 - Please note: The current client is a test version designed for testing the server. We plan to develop a modern, packaged version with a GUI once the project matures.
 
@@ -59,6 +58,20 @@ That's it. Simple as that.
   ```
 
 - You'll know the connection is successful when you are prompted to enter a username.
+
+## About KaguyaIRC (yes, that's what I like to call it) 0.7
+
+In this version, we've implemented quite a few new things, hoping to make this old beast look a bit more usable.
+
+First off, channel permissions have been completely re-architected. If you've never encountered the concept of ONLY_ADMIN_CHANGE_TOPIC, then frankly, that's fantastic. Above all, our design prioritizes user equality and complete anonymity. Therefore, if you create a channel, there's only one way to manage it: memorize the password it gives you upon creation. What if you leave the server and come back? No worries – just use the password to regain your privileges. Remember this: permissions are for *managing*, not for flaunting your identity or anything else. Arrogance will always come back to bite you. Your ability to manage is defined by your actions, not your status. Hence, not many will truly *need* this power. You wouldn't leak it, would you?
+
+It might sound a bit unreasonable, but... this is actually the most logical aspect of the design. You're still you, just with a password. And don't worry, the password vanishes with the channel itself. So often, it's gone before it even has a chance to be compromised.
+
+On a similar note, we've finally added kick and ban functionalities. Channel owners can manage within their respective channels, while server administrators can manage not only channels but also overall server privileges.
+
+Of course, most people's IPs are dynamic nowadays, so who we're actually banning is anyone's guess, and who *you* are after your next login is equally a mystery. But hey, it doesn't matter. Who cares *who* you are? If we did, you wouldn't be here in the first place.
+
+So, that's KaguyaIRC 0.7. I'm genuinely excited to see what it evolves into once it hits 1.0.
 
 ## DevStack
 
