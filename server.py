@@ -1,7 +1,7 @@
 import asyncio
 import logging
-from pydoc import Helper
-from re import A
+import secrets
+import string
 from typing import Dict, Set, Optional, List
 
 import config
@@ -25,6 +25,7 @@ class Client:
         self.username: Optional[str] = None
         self.realname: Optional[str] = None
         self.is_operator = False
+        self.is_registered = False
         self.channels: Set['Channel'] = set()
         self.ip, self.port = writer.get_extra_info('peername')
 
@@ -52,6 +53,9 @@ class Channel:
         self.clients: Set[Client] = set()
         self.topic: Optional[str] = None
         self.password: Optional[str] = None
+        self.owner_key: Optional[str] = None
+        self.owners: Set[Client] = set()
+        self.banned_ips: Set[str] = set()
 
     async def broadcast(self, message: str, sender_to_exclude: Optional[Client] = None):
         """向频道中的所有客户端广播消息，可选择排除一个发送者。"""
@@ -78,6 +82,17 @@ class Server:
         self.clients: Set[Client] = set()
         self.channels: Dict[str, Channel] = {}
         self.nicknames: Dict[str, Client] = {}
+        self.globally_banned_ips: Set[str] = set()
+        self._create_default_channel()
+
+    def _create_default_channel(self):
+        """创建一个持久化的默认频道 #global"""
+        channel_name = "#global"
+        if channel_name not in self.channels:
+            channel = Channel(channel_name, self)
+            channel.topic = "默认全局频道"
+            self.channels[channel_name] = channel
+            logging.info(f"默认频道 {channel_name} 已创建。")
 
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """处理新的客户端连接"""
@@ -141,17 +156,16 @@ class Server:
 
     async def _check_registration(self, client: Client):
         """检查客户端是否已通过发送 NICK 和 USER 完成注册"""
-        if client.nickname and client.username and not client.realname:
-            client.realname = "registered"
+        if not client.is_registered and client.nickname and client.username:
+            client.is_registered = True
             # 001: Welcome message
-            await client.send(f":{config.SERVER_NAME} 001 {client.nickname} :欢迎来到 {config.SERVER_NAME} IRC 服务器")
+            await client.send(f":{config.SERVER_NAME} 001 {client.nickname} :欢迎来到 {config.SERVER_NAME} 服务器")
             # 002: Your host is...
-            await client.send(f":{config.SERVER_NAME} 002 {client.nickname} :你的主机是 {config.SERVER_NAME}, 运行版本 {config.SERVER_VERSION}")
-            # 003: This server was created...
-            await client.send(f":{config.SERVER_NAME} 003 {client.nickname} :该服务器创建于一个晴朗的日子")
-            # 004: Server info
-            await client.send(f":{config.SERVER_NAME} 004 {client.nickname} {config.SERVER_NAME} {config.SERVER_VERSION} i o")
+            await client.send(f":{config.SERVER_NAME} 002 {client.nickname} :运行版本 {config.SERVER_VERSION}")
             logging.info(f"客户端 {client.ip} 完成注册，昵称为 {client.nickname}")
+            
+            if config.IS_TESTING:
+                await client.send(f":{config.SERVER_NAME} 999 {client.nickname} :Hey {client.nickname}, dieser IRC-Server befindet sich noch in der Testphase. Bitte hinterlassen Sie keine vertraulichen Informationen!")
 
     async def handle_nick(self, client: Client, args: List[str]):
         """处理 NICK 命令"""
@@ -172,7 +186,7 @@ class Server:
         client.nickname = new_nick
         
         # 如果用户已经注册，通知所有相关频道昵称已更改
-        if client.realname: # Check if registered
+        if client.is_registered: # Check if registered
             notification = f":{old_prefix} NICK :{new_nick}"
             await client.send(notification)
             for channel in client.channels:
@@ -185,18 +199,13 @@ class Server:
         if len(args) < 4:
             await client.send(f":{config.SERVER_NAME} 461 {client.nickname or '*'} USER :Not enough parameters")
             return
-        if client.username:
+        if client.is_registered:
             await client.send(f":{config.SERVER_NAME} 462 {client.nickname or '*'} :You may not reregister")
             return
         
         client.username = args[0]
         # args[1] 和 args[2] (host 和 server) 通常被忽略
         client.realname = args[3].lstrip(':')
-
-        await client.send(f":{config.SERVER_NAME} 001 :Welcome to {config.SERVER_NAME} , Version {config.SERVER_VERSION}")
-
-        if config.IS_TESTING:
-            await client.send(f":{config.SERVER_NAME} 999 :Hey {client.nickname} , Dieser IRC-Server befindet sich noch in der Testphase. Bitte hinterlassen Sie keine vertraulichen Informationen!")
         
         await self._check_registration(client)
 
@@ -211,8 +220,8 @@ class Server:
         await self.disconnect_client(client, reason)
 
     async def handle_join(self, client: Client, args: List[str]):
-        """处理 JOIN 命令，增加对带密码频道的功能支持。"""
-        if not client.realname: # Not registered
+        """处理 JOIN 命令"""
+        if not client.is_registered: # Not registered
             await client.send(f":{config.SERVER_NAME} 451 {client.nickname or '*'} :You have not registered")
             return
         if not args:
@@ -223,10 +232,21 @@ class Server:
         key = args[1] if len(args) > 1 else None
 
         if channel_name not in self.channels:
-            await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :No such channel, it must be created by an operator first.")
+            # 如果频道不存在，则根据配置决定是否允许创建
+            if config.ONLY_ADMIN_CREATE_CHANNEL and not client.is_operator:
+                await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :No such channel, it must be created by an operator first.")
+                return
+            # 如果允许用户创建，则走创建逻辑
+            await self.handle_create(client, args)
             return
 
         channel = self.channels[channel_name]
+        
+        # 检查是否被封禁
+        if client.ip in channel.banned_ips or client.ip in self.globally_banned_ips:
+            await client.send(f":{config.SERVER_NAME} 474 {client.nickname} {channel_name} :Cannot join channel (+b) - you are banned")
+            return
+            
         if client in channel.clients:
             return
 
@@ -243,7 +263,7 @@ class Server:
 
         nicks_in_channel = ' '.join([c.nickname for c in channel.clients])
         await client.send(f":{config.SERVER_NAME} 353 {client.nickname} = {channel_name} :{nicks_in_channel}")
-        await client.send(f":{config.SERVER_NAME} 366 {client.nickname} {channel_name} :End of /NAMES list.")
+        await client.send(f":{config.SERVER_NAME} 366 {client.nickname} {channel_name} : You were added to the channel.")
 
     async def handle_part(self, client: Client, args: List[str]):
         """处理 PART 命令"""
@@ -267,13 +287,14 @@ class Server:
         channel.remove_client(client)
         logging.info(f"客户端 {client.nickname} 离开频道 {channel_name}")
 
-        if not channel.clients:
+        # PART会删频道，但这里#global是默认的不能删
+        if not channel.clients and channel.name != '#global':
             logging.info(f"频道 {channel_name} 为空，正在移除。")
             del self.channels[channel_name]
     
-    async def handle_privmsg(self, client: Client, args: List[str]):
-        """处理 PRIVMSG 命令 (频道消息和私聊)"""
-        if not client.realname: # Not registered
+    async def handle_msg(self, client: Client, args: List[str]):
+        """处理 MSG 命令 (频道消息和私聊)"""
+        if not client.is_registered: # Not registered
             await client.send(f":{config.SERVER_NAME} 451 {client.nickname or '*'} :You have not registered")
             return
         if len(args) < 2:
@@ -289,8 +310,8 @@ class Server:
             if target not in self.channels or client not in self.channels[target].clients:
                 await client.send(f":{config.SERVER_NAME} 404 {client.nickname} {target} :Cannot send to channel")
                 return
-            # 广播给包括发送者在内的所有人，以简化客户端逻辑
-            await self.channels[target].broadcast(full_message)
+            # 广播给除发送者外的所有人
+            await self.channels[target].broadcast(full_message, sender_to_exclude=client)
         else:
             # 私聊
             if target not in self.nicknames:
@@ -305,7 +326,7 @@ class Server:
                 await client.send(f":{config.SERVER_NAME} 481 {client.nickname} :Permission Denied- You're not an IRC operator.")
                 return
 
-        if not client.realname:
+        if not client.is_registered:
             await client.send(f":{config.SERVER_NAME} 451 {client.nickname or '*'} :You have not registered")
             return
         
@@ -325,7 +346,12 @@ class Server:
             await client.send(f":{config.SERVER_NAME} 442 {client.nickname} {channel_name} :You're not on that channel")
             return
         
-        if len(args) > 1:
+        if len(args) > 1: # 设置话题
+            # 权限检查
+            if client not in channel.owners and not client.is_operator:
+                await client.send(f":{config.SERVER_NAME} 482 {client.nickname} {channel_name} :You're not channel operator")
+                return
+
             new_topic = ' '.join(args[1:]).lstrip(':')
             channel.topic = new_topic
 
@@ -334,7 +360,7 @@ class Server:
             topic_change_msg = f":{client.get_prefix()} TOPIC {channel_name} :{new_topic}"
             await channel.broadcast(topic_change_msg)
 
-        else:
+        else: # 查看话题
             if channel.topic:
                 await client.send(f":{config.SERVER_NAME} 332 {client.nickname} {channel_name} :{channel.topic}")
             else:
@@ -342,7 +368,7 @@ class Server:
 
     async def handle_list(self, client: Client, args: List[str]):
         """处理 LIST 命令，列出所有可用频道"""
-        if not client.realname: # Not registered
+        if not client.is_registered: # Not registered
             await client.send(f":{config.SERVER_NAME} 451 {client.nickname or '*'} :You have not registered")
             return
         
@@ -358,22 +384,32 @@ class Server:
     
     async def handle_help(self, client: Client, args: List[str]):
         """处理 HELP 命令"""
-        if not client.realname: # 检查是否注册
+        if not client.is_registered: # 检查是否注册
             await client.send(f":{config.SERVER_NAME} 451 {client.nickname or '*'} :You have not registered")
             return
         help_messages = [
             "--- 可用命令列表 ---",
             "/NICK <新昵称>                  - 更改你的昵称",
-            "/JOIN <#频道名> <密码>             - 加入一个频道",
-            "/PART [<#频道名>] [原因]          - 离开当前或指定频道",
+            "/JOIN <#频道名> [密码]          - 加入一个频道",
+            "/PART [<#频道名>] [原因]        - 离开当前或指定频道",
             "/MSG <昵称> <消息>              - 向指定用户发送私聊消息",
             "/LIST                           - 列出服务器上所有可用的频道",
             "/QUIT [原因]                    - 断开与服务器的连接",
+            "/CHANNEL <#频道名> <密钥>     - 使用密钥获取频道所有权",
+            "/TOPIC <#频道名> [话题]         - 查看或设置频道话题",
+            "/KICK <#频道名> <用户> [原因]   - 将用户踢出频道 (仅限所有者)",
+            "/BAN <#频道名> <用户>           - 封禁用户IP (仅限所有者)",
+            "/UNBAN <#频道名> <IP>           - 解封IP (仅限所有者)",
         ]
 
         if client.is_operator:
-            help_messages.append("/CREATE <#频道名>               - 创建一个新的频道")
-            help_messages.append("/TOPIC <#频道名> [话题]          - 查看或设置频道话题")
+            help_messages.extend([
+                "--- 管理员命令 ---",
+                "/CREATE <#频道名> [密码]        - 创建一个新的频道",
+                "/ALLBAN <用户/IP>              - 全局封禁用户IP",
+                "/UNALLBAN <IP>                 - 全局解封IP",
+                "/LISTALLBAN                    - 查看全局封禁列表"
+            ])
 
         help_messages.append("--- END OF HELP ---")
 
@@ -381,12 +417,10 @@ class Server:
             await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :{message}")
 
     async def handle_create(self, client: Client, args: List[str]):
-        """处理 CREATE 命令 (仅限管理员)，可选择性添加密码。"""
-
-        if config.ONLY_ADMIN_CREATE_CHANNEL:
-            if not client.is_operator:
-                await client.send(f":{config.SERVER_NAME} 481 {client.nickname} :Permission Denied- You're not an IRC operator.")
-                return
+        """处理 CREATE 命令 (管理员或普通用户)，可选择性添加密码。"""
+        if config.ONLY_ADMIN_CREATE_CHANNEL and not client.is_operator:
+            await client.send(f":{config.SERVER_NAME} 481 {client.nickname} :Permission Denied- You're not an IRC operator.")
+            return
         
         if not args:
             await client.send(f":{config.SERVER_NAME} 461 {client.nickname} CREATE :Not enough parameters. Usage: /create <#channel_name> [password]")
@@ -400,24 +434,209 @@ class Server:
             return
 
         if channel_name in self.channels:
-            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Channel {channel_name} already exists.")
+            await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :Channel already exists.")
             return
 
-        # 创建频道并设置密码
+        # 创建频道并设置密码和所有权密钥
         new_channel = Channel(channel_name, self)
+        
+        # 生成一个安全的密钥
+        key_chars = string.ascii_letters + string.digits
+        owner_key = ''.join(secrets.choice(key_chars) for i in range(16))
+        new_channel.owner_key = owner_key
+        
         if password:
             new_channel.password = password
         
         self.channels[channel_name] = new_channel
         
-        # 根据是否设置密码，发送不同的成功消息
-        if password:
-            logging.info(f"管理员 {client.nickname} 创建了新的私密频道: {channel_name}")
-            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Private channel {channel_name} has been created successfully.")
-        else:
-            logging.info(f"管理员 {client.nickname} 创建了新频道: {channel_name}")
-            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Channel {channel_name} has been created successfully.")
+        # 自动加入创建的频道
+        await self.handle_join(client, [channel_name, password] if password else [channel_name])
+        
+        logging.info(f"客户端 {client.nickname} 创建了新频道: {channel_name}")
+        
+        # 发送成功消息和密钥
+        await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Channel {channel_name} has been created successfully.")
+        await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Your ownership key for {channel_name} is: {owner_key}")
+        await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Use '/CHANNEL {channel_name} {owner_key}' to claim ownership.")
+        # 连续发送5次
+        for i in range(4):
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Ownership Key Reminder: {owner_key}")
 
+    async def handle_channel(self, client: Client, args: List[str]):
+        """处理 CHANNEL 命令以获取频道所有权"""
+        if len(args) < 2:
+            await client.send(f":{config.SERVER_NAME} 461 {client.nickname} CHANNEL :Not enough parameters. Usage: /channel <#channel_name> <key>")
+            return
+
+        channel_name, key = args[0], args[1]
+
+        if channel_name not in self.channels:
+            await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :No such channel.")
+            return
+        
+        channel = self.channels[channel_name]
+        if channel.owner_key == key:
+            channel.owners.add(client)
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :You are now an owner of {channel_name}.")
+            logging.info(f"客户端 {client.nickname} 成为了频道 {channel_name} 的所有者。")
+        else:
+            await client.send(f":{config.SERVER_NAME} 482 {client.nickname} {channel_name} :Incorrect ownership key.")
+
+    async def handle_kick(self, client: Client, args: List[str]):
+        """处理 KICK 命令"""
+        if len(args) < 2:
+            await client.send(f":{config.SERVER_NAME} 461 {client.nickname} KICK :Not enough parameters. Usage: /kick <#channel> <user> [reason]")
+            return
+        
+        channel_name, target_nick = args[0], args[1]
+        reason = ' '.join(args[2:]).lstrip(':') if len(args) > 2 else "Kicked by operator"
+
+        if channel_name not in self.channels:
+            await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :No such channel")
+            return
+        
+        channel = self.channels[channel_name]
+        
+        # 权限检查
+        if client not in channel.owners and not client.is_operator:
+            await client.send(f":{config.SERVER_NAME} 482 {client.nickname} {channel_name} :You're not channel operator")
+            return
+        
+        if target_nick not in self.nicknames:
+            await client.send(f":{config.SERVER_NAME} 401 {client.nickname} {target_nick} :No such nick")
+            return
+
+        target_client = self.nicknames[target_nick]
+        if target_client not in channel.clients:
+            await client.send(f":{config.SERVER_NAME} 441 {client.nickname} {target_nick} {channel_name} :They aren't on that channel")
+            return
+
+        kick_msg = f":{client.get_prefix()} KICK {channel_name} {target_nick} :{reason}"
+        await channel.broadcast(kick_msg)
+        channel.remove_client(target_client)
+        logging.info(f"客户端 {client.nickname} 将 {target_nick} 踢出了频道 {channel_name}")
+
+    async def handle_ban(self, client: Client, args: List[str]):
+        """处理 BAN 命令 (频道级别)"""
+        if len(args) < 2:
+            await client.send(f":{config.SERVER_NAME} 461 {client.nickname} BAN :Not enough parameters. Usage: /ban <#channel> <user>")
+            return
+        
+        channel_name, target_nick = args[0], args[1]
+
+        if channel_name not in self.channels:
+            await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :No such channel")
+            return
+            
+        channel = self.channels[channel_name]
+        # 权限检查
+        if client not in channel.owners and not client.is_operator:
+            await client.send(f":{config.SERVER_NAME} 482 {client.nickname} {channel_name} :You're not channel operator")
+            return
+            
+        if target_nick not in self.nicknames:
+            await client.send(f":{config.SERVER_NAME} 401 {client.nickname} {target_nick} :No such nick")
+            return
+
+        target_client = self.nicknames[target_nick]
+        target_ip = target_client.ip
+        
+        channel.banned_ips.add(target_ip)
+        await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Banned {target_ip} from {channel_name}.")
+        logging.info(f"客户端 {client.nickname} 在频道 {channel_name} 封禁了 IP: {target_ip} (来自用户 {target_nick})")
+        
+        # Kick-ban
+        if target_client in channel.clients:
+            await self.handle_kick(client, [channel_name, target_nick, "Banned"])
+
+    async def handle_unban(self, client: Client, args: List[str]):
+        """处理 UNBAN 命令 (频道级别)"""
+        if len(args) < 2:
+            await client.send(f":{config.SERVER_NAME} 461 {client.nickname} UNBAN :Not enough parameters. Usage: /unban <#channel> <ip>")
+            return
+        
+        channel_name, target_ip = args[0], args[1]
+
+        if channel_name not in self.channels:
+            await client.send(f":{config.SERVER_NAME} 403 {client.nickname} {channel_name} :No such channel")
+            return
+            
+        channel = self.channels[channel_name]
+        # 权限检查
+        if client not in channel.owners and not client.is_operator:
+            await client.send(f":{config.SERVER_NAME} 482 {client.nickname} {channel_name} :You're not channel operator")
+            return
+            
+        if target_ip in channel.banned_ips:
+            channel.banned_ips.remove(target_ip)
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Unbanned {target_ip} from {channel_name}.")
+            logging.info(f"客户端 {client.nickname} 在频道 {channel_name} 解封了 IP: {target_ip}")
+        else:
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :IP {target_ip} is not banned from {channel_name}.")
+
+    async def handle_allban(self, client: Client, args: List[str]):
+        """处理 ALLBAN 命令 (全局级别)"""
+        if not client.is_operator:
+            await client.send(f":{config.SERVER_NAME} 481 {client.nickname} :Permission Denied- You're not an IRC operator.")
+            return
+        if not args:
+            await client.send(f":{config.SERVER_NAME} 461 {client.nickname} ALLBAN :Not enough parameters. Usage: /allban <user/ip>")
+            return
+        
+        target = args[0]
+        target_ip = None
+        
+        # 判断是IP还是昵称
+        if '.' in target or ':' in target: # 简单判断是否为IP
+            target_ip = target
+        elif target in self.nicknames:
+            target_ip = self.nicknames[target].ip
+        else:
+            await client.send(f":{config.SERVER_NAME} 401 {client.nickname} {target} :No such nick")
+            return
+            
+        self.globally_banned_ips.add(target_ip)
+        await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Globally banned {target_ip}.")
+        logging.info(f"管理员 {client.nickname} 全局封禁了 IP: {target_ip}")
+        
+        # 从所有频道踢出该IP对应的所有用户
+        for user_to_kick in list(self.clients):
+            if user_to_kick.ip == target_ip:
+                for channel in list(user_to_kick.channels):
+                    await self.handle_kick(client, [channel.name, user_to_kick.nickname, "Globally Banned"])
+
+    async def handle_unallban(self, client: Client, args: List[str]):
+        """处理 UNALLBAN 命令 (全局级别)"""
+        if not client.is_operator:
+            await client.send(f":{config.SERVER_NAME} 481 {client.nickname} :Permission Denied- You're not an IRC operator.")
+            return
+        if not args:
+            await client.send(f":{config.SERVER_NAME} 461 {client.nickname} UNALLBAN :Not enough parameters. Usage: /unallban <ip>")
+            return
+        
+        target_ip = args[0]
+        if target_ip in self.globally_banned_ips:
+            self.globally_banned_ips.remove(target_ip)
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :Globally unbanned {target_ip}.")
+            logging.info(f"管理员 {client.nickname} 全局解封了 IP: {target_ip}")
+        else:
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :IP {target_ip} is not globally banned.")
+            
+    async def handle_listallban(self, client: Client, args: List[str]):
+        """处理 LISTALLBAN 命令"""
+        if not client.is_operator:
+            await client.send(f":{config.SERVER_NAME} 481 {client.nickname} :Permission Denied- You're not an IRC operator.")
+            return
+        
+        if not self.globally_banned_ips:
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :No IPs are globally banned.")
+            return
+
+        await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :--- Global Ban List ---")
+        for ip in self.globally_banned_ips:
+            await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :- {ip}")
+        await client.send(f":{config.SERVER_NAME} NOTICE {client.nickname} :--- End of List ---")
 
     async def handle_oper(self, client: Client, args: List[str]):
         """处理 OPER 命令"""
